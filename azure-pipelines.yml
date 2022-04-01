@@ -3,22 +3,136 @@
 # Add steps that build, run tests, deploy, and more:
 # https://aka.ms/yaml
 
+resources:
+
+  repositories:
+    - repository: Pipelines.Docker
+      type: git
+      name: Pipelines.Docker
+      ref: refs/tags/v0.0.6
+    - repository: Pipelines.Shared
+      type: git
+      name: Pipelines.Shared
+      ref: refs/tags/v0.0.30
+    - repository: Pipelines.Terraform
+      type: git
+      name: Pipelines.Terraform
+      ref: refs/tags/v0.0.2
+
 trigger:
-- main
+  branches:
+    include:
+      - master
+      - develop
+      - release/*
 
-pool:
-  vmImage: ubuntu-latest
+variables:
+  - group: "VBL API Nonprod"
+  - group: "ssh"  
+  - name: service_name
+    value: "vanquismobilebff"
+  - name: service_name_short
+    value: "mobilebff"
+  - name: service_connection
+    value: "Non-prod Container Regsitry"
+  - name: terraform_version
+    value: "0.13.5"
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+stages:
+  - stage: Build
+    jobs:
+      - job: BuildAndRunUnitTests
+        pool:
+          vmImage: "ubuntu-20.04"
+        steps:
+          - task: DotNetCoreCLI@2
+            displayName: Install dependencies
+            inputs:
+              command: 'restore'
+              projects: 'src/**/*.csproj'
+              feedsToUse: 'config'
+              nugetConfigPath: 'src/nuget.config'
+              workingDirectory: "./"
+          - task: DotNetCoreCLI@2
+            displayName: Build
+            inputs:
+              command: 'build'
+              projects: 'src/**/*.csproj'
+              arguments: '--configuration Release --no-restore'
+              workingDirectory: "./"
+          - task: DotNetCoreCLI@2
+            displayName: Run Unit Tests
+            inputs:
+              command: 'test'
+              projects: 'src/**/*.csproj'
+              arguments: '--configuration Release --no-build --verbosity minimal'
+              testRunTitle: 'Unit Tests'
+              workingDirectory: "./"
+      - job: BuildAndPush
+        pool:
+          vmImage: "ubuntu-20.04"
+        steps:
+          - template: build-push-dockerimage.yml@Pipelines.Docker
+            parameters:
+              image_repo_name: $(service_name)
+              path_to_dockerfile: src/Vanquis.Mobile.BFF.WebApi/Dockerfile
+              service_connection: $(service_connection)
+              push_to_acr: true
+              build_context: "./src"
+              tag_step: set-version-variable-from-changelog.yml@Pipelines.Shared
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
-- task: DotNetCoreCLI@2
-  inputs:
-    command: 'build'
-    projects: 'src/**/*.csproj'
-    arguments: 'Build'
+  - stage: Dev1
+    dependsOn: Build
+    condition: and (succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - template: Deploy/deploy-pipelines.yml
+        parameters:
+            environment: dev1
+
+  - stage: Tst1
+    dependsOn: Dev1
+    condition: and (succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployToTest
+        environment: vanquis-mobile-bff-tst
+      - template: Deploy/deploy-pipelines.yml
+        parameters:
+            environment: tst1
+
+  - stage: Uat1
+    dependsOn: Build
+    condition: and (succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    jobs:
+      - deployment: DeployToUat
+        environment: vanquis-mobile-bff-uat
+      - template: Deploy/deploy-pipelines.yml
+        parameters:
+            environment: uat1
+
+  - stage: Stg1
+    dependsOn: Build
+    condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/master'))
+    variables:
+      - group: "VBL API NEU Prod"
+    jobs:
+       - deployment: DeployToStg
+         environment: vanquis-mobile-bff-stg
+       - template: Deploy/deploy-pipelines.yml
+         parameters:
+            environment: stg1
+            pool: vbl-api-prod
+            subscription: 'vbl-api-prod'
+
+  - stage: Prd1
+    dependsOn: Stg1
+    condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/master'))
+    variables:
+      - group: "VBL API NEU Prod"
+    jobs:
+       - deployment: DeployToPrd
+         environment: vanquis-mobile-bff-prd
+       - template: Deploy/deploy-pipelines.yml
+         parameters:
+            environment: prd1
+            pool: vbl-api-prod
+            subscription: 'vbl-api-prod'
